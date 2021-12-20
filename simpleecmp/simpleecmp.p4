@@ -4,6 +4,7 @@
 #include <tna.p4>
 
 #define PRIME 2147483647
+const bit<19>   ECN_MARK_THRESHOLD = 10;
 /*************************************************************************
  ************* C O N S T A N T S    A N D   T Y P E S  *******************
 *************************************************************************/
@@ -62,17 +63,18 @@ header arp_h {
 header ipv4_h {
     bit<4>       version;
     bit<4>       ihl;
-    bit<7>       diffserv;
-    bit<1>       res;
+    bit<6>       dscp;
+    bit<2>       ecn;
     bit<16>      total_len;
     bit<16>      identification;
-    bit<3>       flags;
+    bit<1>       res;
+    bit<2>       flags;
     bit<13>      frag_offset;
     bit<8>       ttl;
-    bit<8>   protocol;
+    bit<8>       protocol;
     bit<16>      hdr_checksum;
-    bit<32>  src_addr;
-    bit<32>  dst_addr;
+    bit<32>      src_addr;
+    bit<32>      dst_addr;
 }
 
 header icmp_h {
@@ -239,12 +241,12 @@ control Ingress(/* User */
     Hash<bit<9>>(HashAlgorithm_t.CUSTOM,crc32a) hash_i1;
     Hash<bit<9>>(HashAlgorithm_t.CUSTOM,crc32b) hash_i2;
     Hash<bit<9>>(HashAlgorithm_t.CUSTOM,crc32c) hash_i3;
-    Hash<bit<3>>(HashAlgorithm_t.CUSTOM,crc32c) hash_ecmp;
+    Hash<bit<1>>(HashAlgorithm_t.CUSTOM,crc32c) hash_ecmp;
     Hash<bit<14>>(HashAlgorithm_t.CUSTOM,crc32fp) hash_fp;
     Hash<bit<14>>(HashAlgorithm_t.CUSTOM,crc32fp) hash_fpi;
 
 
-bit<3> ecmp=0;
+bit<1> ecmp=0;
 action cal_ecmp()//计算index
     {
         ecmp=hash_ecmp.get({hdr.ipv4.src_addr,hdr.ipv4.dst_addr,meta.ll,hdr.ipv4.protocol});
@@ -313,10 +315,11 @@ control IngressDeparser(packet_out pkt,
             hdr.ipv4.hdr_checksum = ipv4_checksum.update({
                 hdr.ipv4.version,
                 hdr.ipv4.ihl,
-                hdr.ipv4.diffserv,
-                hdr.ipv4.res,
+                hdr.ipv4.dscp,
+                hdr.ipv4.ecn,
                 hdr.ipv4.total_len,
                 hdr.ipv4.identification,
+                hdr.ipv4.res,
                 hdr.ipv4.flags,
                 hdr.ipv4.frag_offset,
                 hdr.ipv4.ttl,
@@ -333,22 +336,24 @@ control IngressDeparser(packet_out pkt,
  ****************  E G R E S S   P R O C E S S I N G   *******************
  *************************************************************************/
 
-    /***********************  H E A D E R S  ************************/
-
+   /***********************  H E A D E R S  ************************/
 
     struct my_egress_headers_t {
-    ethernet_h         ethernet;
-vlan_tag_h[2]      vlan_tag;
-    ipv4_h             ipv4;
-}
 
+    ethernet_h         ethernet;
+    arp_h              arp;
+    vlan_tag_h[2]      vlan_tag;
+    ipv4_h             ipv4;
+
+    }
 
 
     /********  G L O B A L   E G R E S S   M E T A D A T A  *********/
 
-struct my_egress_metadata_t {
-
-}
+    struct my_egress_metadata_t {
+        bit<16>     qdepth;
+        bit<16>     ecn_thres;
+    }
 
     /***********************  P A R S E R  **************************/
 
@@ -362,8 +367,44 @@ parser EgressParser(packet_in        pkt,
     /* This is a mandatory state, required by Tofino Architecture */
     state start {
         pkt.extract(eg_intr_md);
-        transition accept;
+        // pkt.advance(PORT_METADATA_SIZE);
+        transition meta_init;
     }
+    state meta_init{
+        meta.qdepth = 0;
+        meta.ecn_thres = 0;
+        transition parse_ethernet;
+    }
+
+    state parse_ethernet{
+        pkt.extract(hdr.ethernet);
+        transition select((bit<16>)hdr.ethernet.ether_type) {
+            (bit<16>)ether_type_t.TPID &&& 0xEFFF :  parse_vlan_tag;
+            (bit<16>)ether_type_t.IPV4            :  parse_ipv4;
+            (bit<16>)ether_type_t.ARP             :  parse_arp;
+            default :  accept;
+        }       
+    }
+
+    state parse_arp {
+        pkt.extract(hdr.arp);
+        transition  accept;
+    }
+
+    state parse_vlan_tag {
+        pkt.extract(hdr.vlan_tag.next);
+        transition select(hdr.vlan_tag.last.ether_type) {
+            ether_type_t.TPID :  parse_vlan_tag;
+            ether_type_t.IPV4 :  parse_ipv4;
+            default: accept;
+        }    
+    }
+
+    state parse_ipv4 {
+        pkt.extract(hdr.ipv4);
+        transition  accept;  
+    }
+
 }
 
     /***************** M A T C H - A C T I O N  *********************/
@@ -378,11 +419,62 @@ control Egress(
     inout egress_intrinsic_metadata_for_deparser_t     eg_dprsr_md,
     inout egress_intrinsic_metadata_for_output_port_t  eg_oport_md)
 {
-    
+    action mark_ecn(){
+        hdr.ipv4.ecn = 3;
+    }
+
+    table mark_ecn_t{
+        actions = {
+            mark_ecn;
+        }
+        default_action = mark_ecn;
+    }
+
+    Register<bit<16>,bit<16>>(0x1) ecn_reg;
+    RegisterAction<bit<16>,bit<16>,bit<1>>(ecn_reg) cmp_ecn_thres = 
+    {
+        void apply(inout bit<16> register_data, out bit<1> result){
+            register_data = meta.qdepth;
+            if(register_data > ECN_MARK_THRESHOLD){
+                result = 1;
+            }
+            else result = 0;
+        }
+    };
+
+bit<1> ecn_flag;
+    action set_ecn_flag(){
+        ecn_flag = cmp_ecn_thres.execute(0);
+    }
+
+    table set_ecn_flag_t{
+        actions = {
+            set_ecn_flag;
+        }
+        default_action = set_ecn_flag;
+    }
+
+    action ecn_qdepth(){
+        meta.qdepth = eg_intr_md.enq_qdepth[15:0];
+    }
+
+    table ecn_qdepth_t{
+        actions = {
+            ecn_qdepth;
+        }
+        default_action = ecn_qdepth();
+    }
 
     apply {
-      
-}
+        if(hdr.ipv4.ecn == 1 || hdr.ipv4.ecn ==2){
+            ecn_qdepth_t.apply();
+            set_ecn_flag_t.apply();
+            if(ecn_flag == 1){
+                mark_ecn_t.apply();
+            }
+        }
+    }
+
 }
 
 
@@ -396,11 +488,29 @@ control EgressDeparser(packet_out pkt,
     /* Intrinsic */
     in    egress_intrinsic_metadata_for_deparser_t  eg_dprsr_md)
 {
-
-    
+  
+    Checksum() ipv4_checksum;
     
     apply {
-          pkt.emit(hdr);
+        if (hdr.ipv4.isValid()) {
+            hdr.ipv4.hdr_checksum = ipv4_checksum.update({
+                hdr.ipv4.version,
+                hdr.ipv4.ihl,
+                hdr.ipv4.dscp,
+                hdr.ipv4.ecn,
+                hdr.ipv4.total_len,
+                hdr.ipv4.identification,
+                hdr.ipv4.res,
+                hdr.ipv4.flags,
+                hdr.ipv4.frag_offset,
+                hdr.ipv4.ttl,
+                hdr.ipv4.protocol,
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr
+            });  
+        }
+        pkt.emit(hdr);
+        
     }
 }
 
