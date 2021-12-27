@@ -6,16 +6,14 @@
 #define PRIME 2147483647
 #define flowlet_thresh 4000000
 #define entry_num 65536
-#define  ECN_MARK_THRESHOLD 10
-#define  MIRROR_THRESHOLD  100000
+#define  ECN_MARK_THRESHOLD 80
 /*************************************************************************
  ************* C O N S T A N T S    A N D   T Y P E S  *******************
 *************************************************************************/
 enum bit<16> ether_type_t {
     TPID       = 0x8100,
     IPV4       = 0x0800,
-    ARP        = 0x0806,
-    QDE        = 0x3333
+    ARP        = 0x0806
 }
 
 enum bit<8>  ip_proto_t {
@@ -110,19 +108,6 @@ header udp_h {
     bit<16>  checksum;
 }
 
-header mirror_h {
-    bit<48>  dst_addr;
-    bit<48>  src_dst;
-    bit<16>  ether_type;
-    bit<16>  egress_port;
-    bit<16>  qdepth;
-}
-
-header qde_h {
-    bit<16>  egress_port;
-    bit<16>  qdepth;
-}
-
 /*************************************************************************
  **************  I N G R E S S   P R O C E S S I N G   *******************
  *************************************************************************/
@@ -131,7 +116,6 @@ header qde_h {
 
 struct my_ingress_headers_t {
     ethernet_h         ethernet;
-    qde_h              qde;
     arp_h              arp;
     vlan_tag_h[2]      vlan_tag;
     ipv4_h             ipv4;
@@ -154,12 +138,6 @@ struct my_ingress_metadata_t {
     bit<32> deltatime;
 	bit<16> index;
     bit<32> cc;
-    bit<1>  qde_flag;
-    bit<16> port_qdepth;
-    bit<16> port_1;
-    bit<16> port_2;
-    bit<16> qdepth_port_1;
-    bit<16> qdepth_port_2;
     int<32> inttime;
     int<32> ft; 
 }
@@ -191,12 +169,6 @@ parser IngressParser(packet_in        pkt,
         meta.cc=0;
         meta.inttime=0;
         meta.ft=0;
-        meta.qde_flag = 0;
-        meta.port_qdepth = 0;
-        meta.port_1 = 0;
-        meta.port_2 = 0;
-        meta.qdepth_port_2 = 0;
-        meta.qdepth_port_1 = 0;
         transition parse_ethernet;
     }
     
@@ -210,14 +182,8 @@ parser IngressParser(packet_in        pkt,
             (bit<16>)ether_type_t.TPID &&& 0xEFFF :  parse_vlan_tag;
             (bit<16>)ether_type_t.IPV4            :  parse_ipv4;
             (bit<16>)ether_type_t.ARP             :  parse_arp;
-            (bit<16>)ether_type_t.QDE             :  parse_qde;
             default :  accept;
         }
-    }
-
-    state parse_qde {
-        pkt.extract(hdr.qde);
-        transition accept;
     }
 
     state parse_arp {
@@ -282,7 +248,7 @@ control Ingress(/* User */
     inout ingress_intrinsic_metadata_for_tm_t        ig_tm_md)
 {
 
-bit<1> port_select = 0;
+
 
 
 
@@ -301,111 +267,6 @@ bit<1> port_select = 0;
     Hash<bit<1>>(HashAlgorithm_t.CUSTOM,crc32c) hash_ecmp;
     Hash<bit<14>>(HashAlgorithm_t.CUSTOM,crc32fp) hash_fp;
     Hash<bit<14>>(HashAlgorithm_t.CUSTOM,crc32fp) hash_fpi;
-
-
-   /********select minium qdepth to send **********/
-Register<bit<16>,bit<16>>(0x100) qdepth_reg_1;
-RegisterAction<bit<16>,bit<16>,bit<16>>(qdepth_reg_1) qdepth_insert_1 = {
-    void apply(inout bit<16> register_data, out bit<16> result){
-        if(meta.qde_flag == 1){
-            register_data = meta.port_qdepth;
-        }
-        
-    }
-};
-RegisterAction<bit<16>,bit<16>,bit<16>>(qdepth_reg_1) qdepth_query_1 = {
-    void apply(inout bit<16> register_data, out bit<16> result){
-        result = register_data;
-        
-    }
-};
-action qde_insert_1(){
-    qdepth_insert_1.execute(hdr.qde.egress_port);
-}
-
-table qde_insert_1_t{
-    actions = {
-        qde_insert_1;
-    }
-    default_action = qde_insert_1;
-}
-
-Register<bit<16>,bit<16>>(0x100) qdepth_reg_2;
-RegisterAction<bit<16>,bit<16>,bit<16>>(qdepth_reg_2) qdepth_insert_2 = {
-    void apply(inout bit<16> register_data, out bit<16> result){
-        if(meta.qde_flag == 1){
-            register_data = meta.port_qdepth;
-        }
-        
-    }
-};
-RegisterAction<bit<16>,bit<16>,bit<16>>(qdepth_reg_2) qdepth_query_2 = {
-    void apply(inout bit<16> register_data, out bit<16> result){
-        result = register_data;
-    }
-};
-action qde_insert_2(){
-    qdepth_insert_2.execute(hdr.qde.egress_port);
-}
-
-table qde_insert_2_t{
-    actions = {
-        qde_insert_2;
-    }
-    default_action = qde_insert_2;
-}
-
-action route_equ(bit<16> port_1, bit<16> port_2){
-    meta.port_1 = port_1;
-    meta.port_2 = port_2;
-}
-
-table route_equ_t{
-    key = {
-        hdr.ipv4.dst_addr: exact;
-    }
-    actions = {
-        route_equ;
-    }
-    default_action = route_equ(0,0);
-}
-
-action qdepth_query(){
-    meta.qdepth_port_1 = qdepth_query_1.execute(meta.port_1);
-    meta.qdepth_port_2 = qdepth_query_2.execute(meta.port_2);
-}
-
-table qdepth_query_t{
-    actions = {
-        qdepth_query;
-    }
-    default_action = qdepth_query;
-}
-Register<bit<16>, bit<16>>(0x1) cmp_qde_reg;
-RegisterAction<bit<16>, bit<16>, bit<1>>(cmp_qde_reg) cmp_qde=
-{
-    void apply(inout bit<16> register_data, out bit<1> result) {
-        register_data = meta.qdepth_port_2;
-        if(meta.qdepth_port_1 >= register_data){
-            result = 1;
-        }
-        else result = 0;    
-    }
-};
-
-action cmp_qdepth(){
-    port_select = cmp_qde.execute(0);
-}
-
-table cmp_qdepth_t{
-    actions = {
-        cmp_qdepth;
-    }
-    default_action = cmp_qdepth;
-}
-
-
-/********typical flowlet ***/
 
 
 Register<bit<32>, bit<16>>(1) flowlet_reg;
@@ -458,7 +319,7 @@ action pend_thresh()//index
     {
         meta.flag[1:1]=delta_pend.execute(0);
     }
-  table pend_thresh_t
+@stage(8)  table pend_thresh_t
     {
         actions={pend_thresh;}
         default_action=pend_thresh;
@@ -468,7 +329,7 @@ action get_ts_last()//index
     {
         meta.ts_last=output_ts_last.execute(meta.index);//hash_1.get({hdr.ipv4.src_addr,hdr.ipv4.dst_addr,meta.ll,hdr.ipv4.protocol}));
     }
-  table get_ts_last_t
+@stage(1)  table get_ts_last_t
     {
         actions={get_ts_last;}
         default_action=get_ts_last;
@@ -478,7 +339,7 @@ action get_port()//index
     {
         outport=output_port.execute(meta.index);//hash_1.get({hdr.ipv4.src_addr,hdr.ipv4.dst_addr,meta.ll,hdr.ipv4.protocol}));
     }
-  table get_port_t
+@stage(10)  table get_port_t
     {
         actions={get_port;}
         default_action=get_port;
@@ -491,7 +352,7 @@ action get_ts_now()//index
     {
         meta.ts_now=ig_intr_md.ingress_mac_tstamp[31:0];
     }
-  table get_ts_now_t
+@stage(1)  table get_ts_now_t
     {
         actions={get_ts_now;}
         default_action=get_ts_now;
@@ -502,7 +363,7 @@ action get_delta()//index
     {
         meta.deltatime=meta.ts_now-meta.ts_last;
     }
-  table get_delta_t
+@stage(2)  table get_delta_t
     {
         actions={get_delta;}
         default_action=get_delta;
@@ -512,7 +373,7 @@ action get_int()//index
     {
         meta.inttime[30:0]=meta.deltatime[30:0];
     }
-  table get_int_t
+@stage(3)  table get_int_t
     {
         actions={get_int;}
         default_action=get_int;
@@ -521,7 +382,7 @@ action get_thresh(int<32> ft)//index
     {
         meta.ft=ft;
     }
-  table get_thresh_t
+@stage(1)  table get_thresh_t
     {
         actions={get_thresh;}
         default_action=get_thresh(200000);
@@ -532,7 +393,7 @@ action del_int()//index
     {
         meta.inttime=meta.inttime-meta.ft;
     }
-  table del_int_t
+@stage(4)  table del_int_t
     {
         actions={del_int;}
         default_action=del_int;
@@ -542,7 +403,7 @@ action cal_ecmp()//index
     {
         ecmp=hash_ecmp.get({hdr.ipv4.src_addr,hdr.ipv4.dst_addr,meta.ll,hdr.ipv4.protocol,ig_intr_md.ingress_mac_tstamp});
     }
-  table cal_ecmp_t
+@stage(0)  table cal_ecmp_t
     {
         actions={cal_ecmp;}
         default_action=cal_ecmp;
@@ -553,7 +414,7 @@ action if_ecmp(bit<1> sign)//index
     {
         ecmp_able=sign;
     }
-  table if_ecmp_t
+@stage(0)  table if_ecmp_t
     {
         key={hdr.ipv4.dst_addr:exact;}
         actions={if_ecmp;}
@@ -567,7 +428,7 @@ action ecmp_select(bit<16> port)//index
         meta.selected_port=port;
         hdr.ipv4.ttl=hdr.ipv4.ttl-1;
     }
-  table ecmp_select_t
+@stage(1)  table ecmp_select_t
     {   
         key={hdr.ipv4.dst_addr:exact;ecmp:exact;}
         actions={ecmp_select;}
@@ -582,7 +443,7 @@ action ecmp_select(bit<16> port)//index
     action drop() {
         ig_dprsr_md.drop_ctl = 1;
     }
-    table arp_host {
+    @stage(0) table arp_host {
         key = { hdr.arp.proto_dst_addr : exact; }
         actions = { unicast_send; drop; }
         default_action = drop();
@@ -592,12 +453,6 @@ action ecmp_select(bit<16> port)//index
 
 
 apply{
-    if(hdr.qde.isValid()){
-        meta.qde_flag = 1;
-        meta.port_qdepth = hdr.qde.qdepth;
-        qde_insert_1_t.apply();
-        qde_insert_2_t.apply();
-    }
 
    if (hdr.arp.isValid())
     {
@@ -609,16 +464,6 @@ apply{
         meta.index=hash_1.get({hdr.ipv4.src_addr,hdr.ipv4.dst_addr,meta.ll,hdr.ipv4.protocol});
         if_ecmp_t.apply();
         ecmp_select_t.apply();
-
-        //select port 
-        route_equ_t.apply();
-        qdepth_query_t.apply();
-        cmp_qdepth_t.apply();
-        if(port_select == 1){
-            meta.selected_port = meta.port_2;
-        }
-        else meta.selected_port = meta.port_1;
-
         if (ecmp_able==1)
         {   
             get_thresh_t.apply();
@@ -651,10 +496,7 @@ control IngressDeparser(packet_out pkt,
     /* Intrinsic */
     in    ingress_intrinsic_metadata_for_deparser_t  ig_dprsr_md)
 {
-        // Checksum() ipv4_checksum;
-    
-    
-     Checksum() ipv4_checksum;
+    Checksum() ipv4_checksum;
     
     apply {
         if (hdr.ipv4.isValid()) {
@@ -683,26 +525,24 @@ control IngressDeparser(packet_out pkt,
 
     /***********************  H E A D E R S  ************************/
 
+
     struct my_egress_headers_t {
 
     ethernet_h         ethernet;
     arp_h              arp;
-    vlan_tag_h[2]      vlan_tag;
+vlan_tag_h[2]      vlan_tag;
     ipv4_h             ipv4;
 
-    }
+}
+
 
 
     /********  G L O B A L   E G R E S S   M E T A D A T A  *********/
 
-    struct my_egress_metadata_t {
-        bit<16>     qdepth;
-        bit<16>     ecn_thres;
-        bit<32>     ts_now;
-        bit<1>      mirror_flag;
-        mirror_h    mirror;
-        MirrorId_t  session_id;
-    }
+struct my_egress_metadata_t {
+    bit<19> ecn_thres;
+
+}
 
     /***********************  P A R S E R  **************************/
 
@@ -717,12 +557,6 @@ parser EgressParser(packet_in        pkt,
     state start {
         pkt.extract(eg_intr_md);
         // pkt.advance(PORT_METADATA_SIZE);
-        transition meta_init;
-    }
-    state meta_init{
-        meta.qdepth = 0;
-        meta.ecn_thres = 0;
-        meta.mirror_flag = 0;
         transition parse_ethernet;
     }
 
@@ -754,7 +588,6 @@ parser EgressParser(packet_in        pkt,
         pkt.extract(hdr.ipv4);
         transition  accept;  
     }
-
 }
 
     /***************** M A T C H - A C T I O N  *********************/
@@ -769,105 +602,26 @@ control Egress(
     inout egress_intrinsic_metadata_for_deparser_t     eg_dprsr_md,
     inout egress_intrinsic_metadata_for_output_port_t  eg_oport_md)
 {
-
-    Register<bit<32>,bit<16>>(0x1) ts_mirror_reg;
-    RegisterAction<bit<32>,bit<16>,bit<1>>(ts_mirror_reg) ts_mirror_a = 
-    {
-        void apply(inout bit<32> register_data, out bit<1> result){
-            if(meta.ts_now - register_data > MIRROR_THRESHOLD){
-                result = 1;
-            }
-            register_data = meta.ts_now;
-        }
-    };
-
-    action set_mirror_flag(){
-        meta.mirror_flag = ts_mirror_a.execute(0);
-    }
-
-    table set_mirror_flag_t{
-        actions = {
-            set_mirror_flag;
-        }
-        default_action = set_mirror_flag;
-    }
-
-    action set_mirror_header(){
-        meta.mirror.egress_port = (bit<16>)eg_intr_md.egress_port;
-        meta.mirror.qdepth = eg_intr_md.enq_qdepth[15:0];
-    }
-
-    table set_mirror_header_t{
-        actions = {
-            set_mirror_header;
-        }
-        default_action = set_mirror_header;
-    }
-
+    
     action mark_ecn(){
         hdr.ipv4.ecn = 3;
     }
 
     table mark_ecn_t{
         actions = {
-            mark_ecn;
+             mark_ecn;
         }
         default_action = mark_ecn;
     }
 
-    Register<bit<16>,bit<16>>(0x1) ecn_reg;
-    RegisterAction<bit<16>,bit<16>,bit<1>>(ecn_reg) cmp_ecn_thres = 
-    {
-        void apply(inout bit<16> register_data, out bit<1> result){
-            register_data = meta.qdepth;
-            if(register_data > ECN_MARK_THRESHOLD){
-                result = 1;
-            }
-            else result = 0;
-        }
-    };
-
-bit<1> ecn_flag;
-    action set_ecn_flag(){
-        ecn_flag = cmp_ecn_thres.execute(0);
-    }
-
-    table set_ecn_flag_t{
-        actions = {
-            set_ecn_flag;
-        }
-        default_action = set_ecn_flag;
-    }
-
-    action ecn_qdepth(){
-        meta.qdepth = eg_intr_md.enq_qdepth[15:0];
-    }
-
-    table ecn_qdepth_t{
-        actions = {
-            ecn_qdepth;
-        }
-        default_action = ecn_qdepth();
-    }
-
-    
-
     apply {
-        if(hdr.ipv4.ecn == 1 || hdr.ipv4.ecn ==2){
-            ecn_qdepth_t.apply();
-            set_ecn_flag_t.apply();
-            if(ecn_flag == 1){
-                mark_ecn_t.apply();
-            }
-        }
-        set_mirror_flag_t.apply();
-        if(meta.mirror_flag == 1){
-            meta.session_id = 1;
-            set_mirror_header_t.apply();
-            eg_dprsr_md.mirror_type = 1;
-        }
+        // meta.ecn_thres =(bit<19>)ECN_MARK_THRESHOLD;
+        // if(hdr.ipv4.ecn == 1 || hdr.ipv4.ecn ==2){
+        //     if(eg_intr_md.enq_qdepth >= meta.ecn_thres){
+        //         mark_ecn_t.apply();
+        //     }
+        // }
     }
-
 }
 
 
@@ -881,16 +635,9 @@ control EgressDeparser(packet_out pkt,
     /* Intrinsic */
     in    egress_intrinsic_metadata_for_deparser_t  eg_dprsr_md)
 {
-  
     Checksum() ipv4_checksum;
-    Mirror() mirror;
     
     apply {
-
-        if(eg_dprsr_md.mirror_type == 1){
-            mirror.emit<mirror_h>(meta.session_id,meta.mirror);
-        }
-
         if (hdr.ipv4.isValid()) {
             hdr.ipv4.hdr_checksum = ipv4_checksum.update({
                 hdr.ipv4.version,
@@ -908,7 +655,6 @@ control EgressDeparser(packet_out pkt,
             });  
         }
         pkt.emit(hdr);
-        
     }
 }
 
